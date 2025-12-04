@@ -1,0 +1,12 @@
+# PyCharm
+.idea/
+
+# Wirtualne środowisko
+venv/
+.env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+*.txt
