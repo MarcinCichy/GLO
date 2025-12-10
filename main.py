@@ -3,52 +3,434 @@ import os
 import time
 import subprocess
 import holidays
-# WAŻNE: Ten import naprawia błąd "No module named holidays.countries" w pliku EXE
 import holidays.countries.poland
 import calendar
 import win32api
 import win32print
+import configparser
+import logging
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QLabel, QComboBox, QTextEdit,
                              QPushButton, QGroupBox, QCalendarWidget, QTableView,
                              QMessageBox, QFileDialog, QListWidget, QListWidgetItem,
-                             QDialog, QDialogButtonBox, QAbstractItemView)
-from PyQt5.QtCore import Qt, QDate
-from PyQt5.QtGui import QColor, QPainter
+                             QDialog, QDialogButtonBox, QAbstractItemView, QProgressBar)
+from PyQt5.QtCore import Qt, QDate, QThread, pyqtSignal
+from PyQt5.QtGui import QColor, QPainter, QIcon
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
+# === KONFIGURACJA LOGOWANIA BŁĘDÓW ===
+logging.basicConfig(filename='debug.log', level=logging.ERROR,
+                    format='%(asctime)s:%(levelname)s:%(message)s')
 
-# === OKNO WYBORU DRUKARKI ===
+
+# === WĄTEK ROBOCZY (GENEROWANIE W TLE) ===
+class WorkerThread(QThread):
+    progress_updated = pyqtSignal(int)
+    finished = pyqtSignal(dict, str)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, employees, folder, month, year, month_str, holidays_map):
+        super().__init__()
+        self.employees = employees
+        self.folder = folder
+        self.month = month
+        self.year = year
+        self.month_str = month_str
+        self.holidays_map = holidays_map
+        self.generator = ExcelGenerator()
+
+    def run(self):
+        generated_map = {}
+        total = len(self.employees)
+        try:
+            for i, emp in enumerate(self.employees):
+                # Tutaj następuje próba zapisu pliku
+                filepath = self.generator.create_file(emp, self.folder, self.month, self.year, self.month_str,
+                                                      self.holidays_map)
+                generated_map[emp['key']] = filepath
+
+                progress_percent = int(((i + 1) / total) * 100)
+                self.progress_updated.emit(progress_percent)
+
+            self.finished.emit(generated_map, self.folder)
+
+        # --- NOWA OBSŁUGA BŁĘDÓW ---
+        except PermissionError as e:
+            # Błąd 13: Odmowa dostępu (zazwyczaj otwarty plik)
+            clean_msg = (f"Nie można zapisać pliku dla pracownika: {emp['name']}.\n\n"
+                         f"PRAWDOPODOBNA PRZYCZYNA:\n"
+                         f"Plik o tej nazwie jest już otwarty w Excelu lub innym programie.\n\n"
+                         f"ROZWIĄZANIE:\n"
+                         f"Zamknij otwarty plik i spróbuj ponownie.")
+            logging.error(f"PermissionError: {e}")
+            self.error_occurred.emit(clean_msg)
+
+        except Exception as e:
+            # Inne błędy
+            logging.error(f"Critical Error: {e}")
+            self.error_occurred.emit(f"Wystąpił nieoczekiwany błąd:\n{str(e)}")
+
+
+# === LOGIKA EXCELA ===
+class ExcelGenerator:
+    def create_file(self, emp, folder, month, year, month_str, holidays_map):
+        wb = Workbook()
+
+        # ====================================================================
+        # STRONA 1: LISTA OBECNOŚCI
+        # ====================================================================
+        ws = wb.active
+        ws.title = "Lista Obecności"
+        ws.sheet_view.tabSelected = True
+
+        ws.page_setup.paperSize = 9
+        ws.page_setup.orientation = 'portrait'
+        ws.page_setup.fitToPage = True
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 1
+        ws.print_options.horizontalCentered = True
+
+        ws.page_margins.left = 1.78 / 2.54
+        ws.page_margins.right = 1.78 / 2.54
+        ws.page_margins.top = 1.91 / 2.54
+        ws.page_margins.bottom = 1.91 / 2.54
+        ws.page_margins.header = 0
+        ws.page_margins.footer = 0
+
+        # Style
+        font_header_name = 'Cambria'
+        font_body_name = 'Times New Roman'
+        font_title = Font(name=font_header_name, size=14, bold=True)
+        font_emp = Font(name=font_header_name, size=12, bold=True)
+
+        font_table_header_main = Font(name=font_body_name, size=7.5, bold=True)
+        font_table_header_f5 = Font(name=font_body_name, size=7, bold=False)
+
+        font_lp_bold = Font(name=font_body_name, size=7.5, bold=True)
+        font_cell = Font(name=font_body_name, size=10)
+        font_small = Font(name=font_body_name, size=8)
+
+        thin = Side(style='thin', color="000000")
+        medium = Side(style='medium', color="000000")
+        border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
+        grey_fill = PatternFill(start_color="BFBFBF", end_color="BFBFBF", fill_type="solid")
+
+        align_center = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        # Kolumny
+        ws.column_dimensions['A'].width = 4.3
+        ws.column_dimensions['B'].width = 11.5
+        ws.column_dimensions['C'].width = 11.4
+        ws.column_dimensions['D'].width = 17.0
+        ws.column_dimensions['E'].width = 20.5
+        ws.column_dimensions['F'].width = 14.5
+
+        # Nagłówek
+        ws.merge_cells('A1:F1')
+        ws['A1'] = f"LISTA OBECNOŚCI {month_str} {year} ROK"
+        ws['A1'].font = font_title
+        ws['A1'].alignment = align_center
+        ws.row_dimensions[1].height = 25
+
+        ws.merge_cells('A2:F4')
+        ws['A2'] = f"{emp['name']}\n{emp['job']}"
+        ws['A2'].alignment = align_center
+        ws['A2'].font = font_emp
+        ws.row_dimensions[2].height = 15
+        ws.row_dimensions[3].height = 15
+        ws.row_dimensions[4].height = 15
+
+        # Tabela Nagłówki
+        headers_s1 = ["Lp.", "GODZINA\nROZPOCZĘCIA\nPRACY", "GODZINA\nZAKOŃCZENIA\nPRACY", "PODPIS", "UWAGI",
+                      "PODPIS OSOBY\nUPOWAŻNIONEJ\nDO KONTROLI"]
+        ws.row_dimensions[5].height = 51.02
+
+        for col_num, header in enumerate(headers_s1, 1):
+            cell = ws.cell(row=5, column=col_num, value=header)
+            cell.border = border_thin
+
+            if col_num == 6:
+                cell.font = font_table_header_f5
+                cell.alignment = align_center
+                cell.fill = grey_fill
+            else:
+                cell.font = font_table_header_main
+                cell.alignment = align_center
+
+        # Dni
+        days_in_month = calendar.monthrange(year, month)[1]
+        row_height_points_s1 = 18.2
+
+        for day in range(1, 32):
+            row = 5 + day
+            ws.row_dimensions[row].height = row_height_points_s1
+            cell_lp = ws.cell(row=row, column=1)
+            cell_lp.alignment = align_center
+            cell_lp.border = border_thin
+            cell_lp.font = font_lp_bold
+            for col in range(2, 7):
+                c = ws.cell(row=row, column=col)
+                c.border = border_thin
+                c.font = font_cell
+            if day <= days_in_month:
+                cell_lp.value = day
+                if QDate(year, month, day) in holidays_map:
+                    for col in range(1, 7): ws.cell(row=row, column=col).fill = grey_fill
+            else:
+                cell_lp.value = "X"
+                for col in range(2, 7):
+                    ws.cell(row=row, column=col).value = "X"
+                    ws.cell(row=row, column=col).alignment = align_center
+
+        # Stopka
+        last_row_s1 = 37
+        ws.row_dimensions[last_row_s1].height = 20
+        ws.merge_cells(f'A{last_row_s1}:E{last_row_s1}')
+        ws[f'A{last_row_s1}'] = "Oznaczenia: N - nieobecność;"
+        ws[f'A{last_row_s1}'].font = font_small
+        ws[f'A{last_row_s1}'].alignment = Alignment(horizontal='left', vertical='center')
+
+        ws.cell(row=last_row_s1, column=6).border = Border(top=medium)
+
+        # Ramki Grube
+        for col in range(1, 7):
+            ws.cell(row=1, column=col).border = Border(top=medium, bottom=ws.cell(row=1, column=col).border.bottom,
+                                                       left=ws.cell(row=1, column=col).border.left,
+                                                       right=ws.cell(row=1, column=col).border.right)
+        for col in range(1, 7):
+            ws.cell(row=36, column=col).border = Border(top=ws.cell(row=36, column=col).border.top, bottom=medium,
+                                                        left=ws.cell(row=36, column=col).border.left,
+                                                        right=ws.cell(row=36, column=col).border.right)
+        for row in range(1, 37):
+            ws.cell(row=row, column=1).border = Border(top=ws.cell(row=row, column=1).border.top,
+                                                       bottom=ws.cell(row=row, column=1).border.bottom, left=medium,
+                                                       right=ws.cell(row=row, column=1).border.right)
+        for row in range(1, 37):
+            ws.cell(row=row, column=6).border = Border(top=ws.cell(row=row, column=6).border.top,
+                                                       bottom=ws.cell(row=row, column=6).border.bottom,
+                                                       left=ws.cell(row=row, column=6).border.left, right=medium)
+
+        # ====================================================================
+        # STRONA 2: EWIDENCJA CZASU PRACY
+        # ====================================================================
+        ws2 = wb.create_sheet("Ewidencja")
+        ws2.sheet_view.tabSelected = True
+
+        ws2.page_setup.paperSize = 9
+        ws2.page_setup.orientation = 'portrait'
+        ws2.page_setup.fitToPage = True
+        ws2.page_setup.fitToWidth = 1
+        ws2.page_setup.fitToHeight = 1
+        ws2.print_options.horizontalCentered = True
+
+        ws2.page_margins.left = 1.78 / 2.54
+        ws2.page_margins.right = 1.78 / 2.54
+        ws2.page_margins.top = 1.91 / 2.54
+        ws2.page_margins.bottom = 1.50 / 2.54
+
+        font_s2_group_header = Font(name=font_body_name, size=8, bold=False)
+        font_s2_vert_8 = Font(name=font_body_name, size=8, bold=False)
+        font_s2_vert_7 = Font(name=font_body_name, size=7, bold=False)
+        font_s2_day_lp = Font(name=font_body_name, size=10, bold=False)
+        font_s2_cell_data = Font(name=font_body_name, size=10, bold=False)
+        font_s2_razem = Font(name=font_body_name, size=7, bold=False)
+        font_s2_legend = Font(name=font_body_name, size=8, bold=False)
+        font_s2_sign = Font(name=font_body_name, size=10, bold=False)
+        align_vertical_90 = Alignment(textRotation=90, horizontal='center', vertical='center', wrap_text=True)
+
+        ws2.column_dimensions['A'].width = 3.6
+        ws2.column_dimensions['B'].width = 6.0
+        for col_letter in ['C', 'D', 'E']: ws2.column_dimensions[col_letter].width = 4.2
+        for col_letter in ['F', 'G', 'H', 'I']: ws2.column_dimensions[col_letter].width = 4.2
+        for col_letter in ['J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q']: ws2.column_dimensions[col_letter].width = 3.3
+        ws2.column_dimensions['R'].width = 9.5
+
+        ws2.row_dimensions[1].height = 31
+        ws2.row_dimensions[2].height = 76
+
+        ws2.merge_cells('A1:A2')
+        ws2['A1'] = "Dzień\nmiesiąca"
+        ws2['A1'].font = font_s2_vert_8
+        ws2['A1'].alignment = align_vertical_90
+        ws2['A1'].border = border_thin
+
+        ws2['B1'] = "Czas\npracy"
+        ws2['B1'].font = font_s2_group_header
+        ws2['B1'].alignment = align_center
+        ws2['B1'].border = border_thin
+
+        ws2.merge_cells('C1:E1')
+        ws2['C1'] = "Czas przepracowany w\ngodzinach"
+        ws2['C1'].font = font_s2_group_header
+        ws2['C1'].alignment = align_center
+        ws2['C1'].border = border_thin
+
+        ws2.merge_cells('F1:Q1')
+        ws2['F1'] = "Czas nieobecności w pracy w godzinach"
+        ws2['F1'].font = font_s2_group_header
+        ws2['F1'].alignment = align_center
+        ws2['F1'].border = border_thin
+
+        ws2['R1'] = "Normatywny\nczas pracy z\nKP"
+        ws2['R1'].font = font_s2_group_header
+        ws2['R1'].alignment = align_center
+        ws2['R1'].border = border_thin
+        ws2['R2'].border = border_thin
+
+        # R2 - Czas Pracy
+        working_days_kp = 0
+        for day in range(1, days_in_month + 1):
+            q_date = QDate(year, month, day)
+            if q_date in holidays_map:
+                continue
+            working_days_kp += 1
+
+        working_hours_kp = working_days_kp * 8
+
+        ws2['R2'].value = f"w dniach: {working_days_kp}\nw godzinach: {working_hours_kp}"
+        ws2['R2'].alignment = Alignment(wrap_text=True, horizontal='center', vertical='center')
+        ws2['R2'].font = font_s2_group_header
+
+        headers_row2 = {
+            'B': "Liczba godzin\nprzepracowanych",
+            'C': "Niedziele i święta",
+            'D': "W porze nocnej",
+            'E': "W godzinach\nnadliczbowych",
+            'F': "Urlop wypoczynkowy",
+            'G': "Opieka KP 188 §1",
+            'H': "Opieka zasiłek",
+            'I': "L4 zwolnienie lekarskie",
+            'J': "Urlop okolicznościowy",
+            'K': "Urlop wypoczynkowy\n\"na żądanie\"",
+            'L': "Urlop bezpłatny",
+            'M': "Dni wolne za święto\nprzypadające w sobotę",
+            'N': "Urlop macierzyński",
+            'O': "Urlop rodzicielski",
+            'P': "Urlop dodatkowy",
+            'Q': ""
+        }
+
+        for col_idx, col_char in enumerate("ABCDEFGHIJKLMNOPQR", 1):
+            if col_idx == 1 or col_idx == 18: continue
+            cell = ws2.cell(row=2, column=col_idx)
+            cell.border = border_thin
+            if col_char in headers_row2:
+                cell.value = headers_row2[col_char]
+                cell.alignment = align_vertical_90
+                if col_idx <= 5:
+                    cell.font = font_s2_vert_8
+                else:
+                    cell.font = font_s2_vert_7
+            if col_idx >= 3 and col_idx <= 17:
+                ws2.cell(row=1, column=col_idx).border = border_thin
+
+        row_height_s2 = 17
+        for day in range(1, 32):
+            row = 2 + day
+            ws2.row_dimensions[row].height = row_height_s2
+            cell_day = ws2.cell(row=row, column=1)
+            cell_day.alignment = align_center
+            cell_day.border = border_thin
+            cell_day.font = font_s2_day_lp
+            for col in range(2, 19):
+                c = ws2.cell(row=row, column=col)
+                c.border = border_thin
+                c.font = font_s2_cell_data
+                c.alignment = align_center
+            if day <= days_in_month:
+                cell_day.value = day
+                if QDate(year, month, day) in holidays_map:
+                    for col in range(1, 19): ws2.cell(row=row, column=col).fill = grey_fill
+            else:
+                cell_day.value = "X"
+                for col in range(2, 19): ws2.cell(row=row, column=col).value = "X"
+
+        row_razem = 34
+        ws2.row_dimensions[row_razem].height = row_height_s2
+        cell_razem = ws2.cell(row=row_razem, column=1, value="razem")
+        cell_razem.font = font_s2_razem
+        cell_razem.alignment = align_center
+        cell_razem.border = border_thin
+        for col in range(2, 19):
+            c = ws2.cell(row=row_razem, column=col)
+            c.border = border_thin
+            c.font = font_s2_razem
+
+        footer_row = 35
+        ws2.row_dimensions[footer_row].height = 77.4
+        ws2.merge_cells(f'A{footer_row}:R{footer_row}')
+        legend_text = (
+            "Urlop wypoczynkowy, Opieka Art 188§1, Opieka zasiłek, L4, Urlop okolicznościowy, Urlop wypoczynkowy \"na żądanie\",  Urlop bezpłatny,  "
+            "Dn - Wypłata nadgodzin, Wś - Wolne za pracę w święto, Wn - Wolne za nadgodziny, W5 - Wolne z tytułu 5-dniowego tygodnia pracy, "
+            "W - Urlop wychowawczy, Um - Urlop macierzyński, ŚR - Świadczenia reabilitacyjne, Śs - Świadek w sądzie, Kr - Oddanie krwi., "
+            "S-szkolenie z udzielania dziecku pierwszej pomocy, D-delegacje/podróże służbowe, P-dni wolne na poszukiwanie pracy, "
+            "Urek-nieobecności za które zgodnie z par. 16 pkt 2 rozporządzenia w sprawie sposobu usprawiedliwienia nieobecności w pracy "
+            "oraz udzielania pracownikom zwolnień od pracy, pracownicy mają prawo do uzyskania rekompensaty pieniężnej od właściwego organu,"
+            "Sn - spóźnienie, N-nieusprawiedliwione nieobecności w pracy, Nun-nieobecność usprawiedliwiona niepłatna"
+        )
+        leg_cell = ws2[f'A{footer_row}']
+        leg_cell.value = legend_text
+        leg_cell.font = font_s2_legend
+        leg_cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+        leg_cell.border = border_thin
+
+        sign_row = footer_row + 1
+        ws2.row_dimensions[sign_row].height = 13
+        ws2.merge_cells(f'A{sign_row}:E{sign_row}')
+        ws2[f'A{sign_row}'] = "PODPIS KADR"
+        ws2[f'A{sign_row}'].alignment = align_center
+        ws2[f'A{sign_row}'].font = font_s2_sign
+        ws2[f'A{sign_row}'].border = None
+
+        ws2.merge_cells(f'F{sign_row}:R{sign_row}')
+        ws2[f'F{sign_row}'] = "PODPIS DYREKTORA ŻŁOBKA"
+        ws2[f'F{sign_row}'].alignment = align_center
+        ws2[f'F{sign_row}'].font = font_s2_sign
+        ws2[f'F{sign_row}'].border = None
+
+        frame_last_row = 35
+        for col in range(1, 19):
+            ws2.cell(row=1, column=col).border = Border(top=medium, bottom=thin, left=thin, right=thin)
+        ws2['A35'].border = Border(top=thin, bottom=medium, left=medium, right=medium)
+        for row in range(1, frame_last_row + 1):
+            c = ws2.cell(row=row, column=1)
+            curr = c.border
+            c.border = Border(top=curr.top, bottom=curr.bottom, left=medium, right=curr.right)
+        for row in range(1, frame_last_row + 1):
+            c = ws2.cell(row=row, column=18)
+            curr = c.border
+            c.border = Border(top=curr.top, bottom=curr.bottom, left=curr.left, right=medium)
+
+        filename = f"{emp['name'].replace(' ', '_')}_{month_str}_{year}.xlsx"
+        path = os.path.join(folder, filename)
+        wb.save(path)
+        return path
+
+
+# === OKNA POMOCNICZE ===
 class PrinterDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Wybierz drukarkę")
         self.resize(400, 200)
         self.selected_printer = None
-
         layout = QVBoxLayout()
         layout.addWidget(QLabel("Wybierz urządzenie do wydruku:"))
-
         self.printer_combo = QComboBox()
         self.printers = self.get_system_printers()
         default_printer = win32print.GetDefaultPrinter()
-
         for p in self.printers:
             self.printer_combo.addItem(p)
             if p == default_printer:
                 self.printer_combo.setCurrentText(p)
-
         layout.addWidget(self.printer_combo)
-
         self.btn_properties = QPushButton("Sprawdź ustawienia / Włącz Duplex")
         self.btn_properties.clicked.connect(self.open_printer_properties)
         layout.addWidget(self.btn_properties)
-
         layout.addWidget(
             QLabel("<i>Wskazówka: Kliknij powyżej, aby upewnić się,<br>że druk dwustronny jest włączony.</i>"))
-
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -64,8 +446,7 @@ class PrinterDialog(QDialog):
 
     def open_printer_properties(self):
         printer_name = self.printer_combo.currentText()
-        if not printer_name:
-            return
+        if not printer_name: return
         try:
             cmd = f'rundll32 printui.dll,PrintUIEntry /p /n "{printer_name}"'
             subprocess.Popen(cmd, shell=True)
@@ -77,7 +458,6 @@ class PrinterDialog(QDialog):
         super().accept()
 
 
-# === OKNO EDYCJI TEKSTOWEJ PRACOWNIKÓW ===
 class EdytorPracownikow(QDialog):
     def __init__(self, current_text, parent=None):
         super().__init__(parent)
@@ -98,7 +478,6 @@ class EdytorPracownikow(QDialog):
         return self.text_edit.toPlainText()
 
 
-# === KLASA KALENDARZA ===
 class KlikalnyKalendarz(QCalendarWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -127,18 +506,36 @@ class KlikalnyKalendarz(QCalendarWidget):
 class GeneratorListObecnosci(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Generator List Obecności v8.4")
+        self.setWindowTitle("Generator List Obecności v10.0 (Folder+Error)")
         self.setGeometry(100, 100, 1000, 700)
         self.generated_files_map = {}
+
+        self.config = configparser.ConfigParser()
+        self.last_save_folder = ""
+        self.load_config()
+
         self.initUI()
         self.load_employees_on_startup()
+
+    def load_config(self):
+        if os.path.exists('config.ini'):
+            try:
+                self.config.read('config.ini')
+                self.last_save_folder = self.config.get('SETTINGS', 'LastFolder', fallback="")
+            except Exception:
+                pass
+
+    def save_config(self):
+        self.config['SETTINGS'] = {'LastFolder': self.last_save_folder}
+        with open('config.ini', 'w') as configfile:
+            self.config.write(configfile)
 
     def initUI(self):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QHBoxLayout()
 
-        # LEWY PANEL
+        # LEWY
         left_panel = QVBoxLayout()
 
         date_group = QGroupBox("1. Wybierz okres")
@@ -147,16 +544,13 @@ class GeneratorListObecnosci(QMainWindow):
         self.month_names = ["Styczeń", "Luty", "Marzec", "Kwiecień", "Maj", "Czerwiec",
                             "Lipiec", "Sierpień", "Wrzesień", "Październik", "Listopad", "Grudzień"]
         self.month_cb.addItems(self.month_names)
-
         self.year_cb = QComboBox()
         current_year = QDate.currentDate().year()
         for y in range(current_year - 1, current_year + 5):
             self.year_cb.addItem(str(y))
         self.year_cb.setCurrentText(str(current_year))
-
         self.month_cb.currentIndexChanged.connect(self.sync_calendar_from_combo)
         self.year_cb.currentIndexChanged.connect(self.sync_calendar_from_combo)
-
         date_layout.addWidget(QLabel("Miesiąc:"))
         date_layout.addWidget(self.month_cb)
         date_layout.addWidget(QLabel("Rok:"))
@@ -170,13 +564,11 @@ class GeneratorListObecnosci(QMainWindow):
         self.emp_list_widget.setSelectionMode(QAbstractItemView.NoSelection)
         self.emp_list_widget.itemChanged.connect(self.update_print_button_state)
         emp_layout.addWidget(self.emp_list_widget)
-
         edit_btns_layout = QHBoxLayout()
         self.btn_edit_text = QPushButton("Edytuj listę")
         self.btn_edit_text.clicked.connect(self.open_text_editor)
         self.btn_toggle_select = QPushButton("Odznacz wszystkich")
         self.btn_toggle_select.clicked.connect(self.toggle_selection)
-
         edit_btns_layout.addWidget(self.btn_edit_text)
         edit_btns_layout.addWidget(self.btn_toggle_select)
         emp_layout.addLayout(edit_btns_layout)
@@ -188,8 +580,12 @@ class GeneratorListObecnosci(QMainWindow):
         self.generate_btn = QPushButton("Generuj wybrane")
         self.generate_btn.setMinimumHeight(40)
         self.generate_btn.setStyleSheet("font-weight: bold; font-size: 14px; background-color: #4CAF50; color: white;")
-        self.generate_btn.clicked.connect(self.start_generation)
+        self.generate_btn.clicked.connect(self.start_generation_thread)
         action_layout.addWidget(self.generate_btn)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        action_layout.addWidget(self.progress_bar)
 
         self.print_btn = QPushButton("Drukuj karty...")
         self.print_btn.setMinimumHeight(40)
@@ -197,24 +593,33 @@ class GeneratorListObecnosci(QMainWindow):
         self.print_btn.clicked.connect(self.print_generated_files)
         self.print_btn.setEnabled(False)
         action_layout.addWidget(self.print_btn)
+
+        # --- ZMIANA: NOWY PRZYCISK OTWÓRZ FOLDER ---
+        self.open_folder_btn = QPushButton("Otwórz folder")
+        self.open_folder_btn.clicked.connect(self.open_last_folder)
+        # Jeśli jest zapisany folder w configu i istnieje, aktywuj przycisk od razu
+        if self.last_save_folder and os.path.exists(self.last_save_folder):
+            self.open_folder_btn.setEnabled(True)
+        else:
+            self.open_folder_btn.setEnabled(False)
+        action_layout.addWidget(self.open_folder_btn)
+
         action_group.setLayout(action_layout)
         left_panel.addWidget(action_group)
         main_layout.addLayout(left_panel, stretch=1)
 
-        # PRAWY PANEL
+        # PRAWY
         right_panel = QVBoxLayout()
         cal_group = QGroupBox("3. Kalendarz (Święta i dni wolne)")
         cal_layout = QVBoxLayout()
         cal_layout.addWidget(QLabel(
             "SZARY = Wolne ustawowo | CZERWONY = Wolne dodatkowe\nUżyj rolki myszy na kalendarzu, aby zmienić miesiąc."))
-
         self.calendar = KlikalnyKalendarz()
         self.calendar.setGridVisible(True)
         self.calendar.setVerticalHeaderFormat(QCalendarWidget.NoVerticalHeader)
         self.calendar.setNavigationBarVisible(False)
         self.calendar.currentPageChanged.connect(self.sync_combo_from_calendar)
         self.calendar.clicked.connect(self.toggle_holiday)
-
         cal_layout.addWidget(self.calendar)
         cal_group.setLayout(cal_layout)
         right_panel.addWidget(cal_group, stretch=2)
@@ -340,7 +745,7 @@ class GeneratorListObecnosci(QMainWindow):
                 self.print_btn.setEnabled(False)
                 self.print_btn.setText("Zaznacz pracowników do druku")
 
-    def start_generation(self):
+    def start_generation_thread(self):
         employees_to_generate = []
         for i in range(self.emp_list_widget.count()):
             item = self.emp_list_widget.item(i)
@@ -355,27 +760,51 @@ class GeneratorListObecnosci(QMainWindow):
             QMessageBox.warning(self, "Błąd", "Nie zaznaczono żadnego pracownika!")
             return
 
-        folder = QFileDialog.getExistingDirectory(self, "Wybierz folder zapisu")
+        folder = QFileDialog.getExistingDirectory(self, "Wybierz folder zapisu", self.last_save_folder)
         if not folder:
             return
 
-        self.generated_files_map = {}
+        self.last_save_folder = folder
+        self.save_config()
+
+        # Aktywacja przycisku folderu (skoro wybrano folder)
+        self.open_folder_btn.setEnabled(True)
+
         month_idx = self.month_cb.currentIndex() + 1
         year = int(self.year_cb.currentText())
         month_name = self.month_names[month_idx - 1].upper()
         holidays_map = self.calculate_holidays(year, month_idx)
 
-        try:
-            for emp in employees_to_generate:
-                filepath = self.create_excel_file(emp, folder, month_idx, year, month_name, holidays_map)
-                self.generated_files_map[emp['key']] = filepath
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.generate_btn.setEnabled(False)
+        self.print_btn.setEnabled(False)
 
-            QMessageBox.information(self, "Sukces",
-                                    f"Wygenerowano plików: {len(employees_to_generate)}\nMożesz teraz zarządzać drukowaniem.")
-            self.update_print_button_state()
+        self.thread = WorkerThread(employees_to_generate, folder, month_idx, year, month_name, holidays_map)
+        self.thread.progress_updated.connect(self.progress_bar.setValue)
+        self.thread.finished.connect(self.on_generation_finished)
+        self.thread.error_occurred.connect(self.on_generation_error)
+        self.thread.start()
 
-        except Exception as e:
-            QMessageBox.critical(self, "Błąd krytyczny", str(e))
+    def on_generation_finished(self, generated_map, folder):
+        self.generated_files_map = generated_map
+        self.progress_bar.setVisible(False)
+        self.generate_btn.setEnabled(True)
+        self.update_print_button_state()
+        QMessageBox.information(self, "Sukces", f"Wygenerowano plików: {len(generated_map)}")
+
+    def on_generation_error(self, error_msg):
+        self.progress_bar.setVisible(False)
+        self.generate_btn.setEnabled(True)
+        # --- ZMIANA: Wyświetlanie czytelnego błędu przekazanego z wątku ---
+        QMessageBox.critical(self, "Błąd generowania", error_msg)
+
+    # --- NOWA METODA: OTWIERANIE FOLDERU ---
+    def open_last_folder(self):
+        if self.last_save_folder and os.path.exists(self.last_save_folder):
+            os.startfile(self.last_save_folder)
+        else:
+            QMessageBox.warning(self, "Info", "Folder nie został jeszcze wybrany lub nie istnieje.")
 
     def print_generated_files(self):
         files_to_print = []
@@ -399,322 +828,17 @@ class GeneratorListObecnosci(QMainWindow):
                     time.sleep(2)
                 QMessageBox.information(self, "Sukces", f"Wysłano {len(files_to_print)} plików do: {selected_printer}")
             except Exception as e:
+                logging.error(f"Błąd druku: {e}")
                 QMessageBox.critical(self, "Błąd druku", f"Wystąpił błąd: {e}")
             finally:
                 win32print.SetDefaultPrinter(original_printer)
 
-    def create_excel_file(self, emp, folder, month, year, month_str, holidays_map):
-        wb = Workbook()
-
-        # S1
-        ws = wb.active
-        ws.title = "Lista Obecności"
-        ws.sheet_view.tabSelected = True
-
-        ws.page_setup.paperSize = 9
-        ws.page_setup.orientation = 'portrait'
-        ws.page_setup.fitToPage = True
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 1
-        ws.print_options.horizontalCentered = True
-
-        ws.page_margins.left = 1.78 / 2.54
-        ws.page_margins.right = 1.78 / 2.54
-        ws.page_margins.top = 1.91 / 2.54
-        ws.page_margins.bottom = 1.91 / 2.54
-        ws.page_margins.header = 0
-        ws.page_margins.footer = 0
-
-        font_header_name = 'Cambria'
-        font_body_name = 'Times New Roman'
-        font_title = Font(name=font_header_name, size=14, bold=True)
-        font_emp = Font(name=font_header_name, size=12, bold=True)
-        font_table_header_main = Font(name=font_body_name, size=7.5, bold=True)
-        font_table_header_last_nobold = Font(name=font_body_name, size=6, bold=False)
-        font_lp_bold = Font(name=font_body_name, size=7.5, bold=True)
-        font_cell = Font(name=font_body_name, size=10)
-        font_small = Font(name=font_body_name, size=8)
-
-        thin = Side(style='thin', color="000000")
-        medium = Side(style='medium', color="000000")
-        border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
-        grey_fill = PatternFill(start_color="BFBFBF", end_color="BFBFBF", fill_type="solid")
-
-        align_center = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        align_left_top = Alignment(horizontal='left', vertical='top', wrap_text=True)
-        align_left_center = Alignment(horizontal='left', vertical='center', wrap_text=True)
-        align_vertical_90 = Alignment(textRotation=90, horizontal='center', vertical='center', wrap_text=True)
-        align_vertical_90_nowrap = Alignment(textRotation=90, horizontal='center', vertical='center', wrap_text=False)
-
-        ws.column_dimensions['A'].width = 4.3
-        ws.column_dimensions['B'].width = 11.5
-        ws.column_dimensions['C'].width = 11.4
-        ws.column_dimensions['D'].width = 17.0
-        ws.column_dimensions['E'].width = 20.5
-        ws.column_dimensions['F'].width = 14.5  # Szeroka kolumna dla "J"
-
-        ws.merge_cells('A1:F1')
-        ws['A1'] = f"LISTA OBECNOŚCI {month_str} {year} ROK"
-        ws['A1'].font = font_title
-        ws['A1'].alignment = align_center
-        ws.row_dimensions[1].height = 25
-
-        ws.merge_cells('A2:F4')
-        ws['A2'] = f"{emp['name']}\n{emp['job']}"
-        ws['A2'].alignment = align_center
-        ws['A2'].font = font_emp
-        ws.row_dimensions[2].height = 15
-        ws.row_dimensions[3].height = 15
-        ws.row_dimensions[4].height = 15
-
-        headers_s1 = ["Lp.", "GODZINA\nROZPOCZĘCIA\nPRACY", "GODZINA\nZAKOŃCZENIA\nPRACY", "PODPIS", "UWAGI",
-                      "PODPIS OSOBY\nUPOWAŻNIONEJ\nDO KONTROLI"]
-        ws.row_dimensions[5].height = 51.02
-
-        for col_num, header in enumerate(headers_s1, 1):
-            cell = ws.cell(row=5, column=col_num, value=header)
-            cell.border = border_thin
-            if col_num == 6:
-                cell.font = font_table_header_last_nobold
-                cell.alignment = align_vertical_90_nowrap
-                cell.fill = grey_fill
-            else:
-                cell.font = font_table_header_main
-                cell.alignment = align_center
-
-        days_in_month = calendar.monthrange(year, month)[1]
-        row_height_points_s1 = 18.2
-
-        for day in range(1, 32):
-            row = 5 + day
-            ws.row_dimensions[row].height = row_height_points_s1
-            cell_lp = ws.cell(row=row, column=1)
-            cell_lp.alignment = align_center
-            cell_lp.border = border_thin
-            cell_lp.font = font_lp_bold
-            for col in range(2, 7):
-                c = ws.cell(row=row, column=col)
-                c.border = border_thin
-                c.font = font_cell
-            if day <= days_in_month:
-                cell_lp.value = day
-                if QDate(year, month, day) in holidays_map:
-                    for col in range(1, 7): ws.cell(row=row, column=col).fill = grey_fill
-            else:
-                cell_lp.value = "X"
-                for col in range(2, 7):
-                    ws.cell(row=row, column=col).value = "X"
-                    ws.cell(row=row, column=col).alignment = align_center
-
-        last_row_s1 = 37
-        ws.row_dimensions[last_row_s1].height = 20
-        ws.merge_cells(f'A{last_row_s1}:E{last_row_s1}')
-        ws[f'A{last_row_s1}'] = "Oznaczenia: N - nieobecność;"
-        ws[f'A{last_row_s1}'].font = font_small
-        ws[f'A{last_row_s1}'].alignment = align_left_center
-        ws.cell(row=last_row_s1, column=6).border = Border(top=medium)
-
-        for col in range(1, 7):
-            ws.cell(row=1, column=col).border = Border(top=medium, bottom=ws.cell(row=1, column=col).border.bottom,
-                                                       left=ws.cell(row=1, column=col).border.left,
-                                                       right=ws.cell(row=1, column=col).border.right)
-        for col in range(1, 7):
-            ws.cell(row=36, column=col).border = Border(top=ws.cell(row=36, column=col).border.top, bottom=medium,
-                                                        left=ws.cell(row=36, column=col).border.left,
-                                                        right=ws.cell(row=36, column=col).border.right)
-        for row in range(1, 37):
-            ws.cell(row=row, column=1).border = Border(top=ws.cell(row=row, column=1).border.top,
-                                                       bottom=ws.cell(row=row, column=1).border.bottom, left=medium,
-                                                       right=ws.cell(row=row, column=1).border.right)
-        for row in range(1, 37):
-            ws.cell(row=row, column=6).border = Border(top=ws.cell(row=row, column=6).border.top,
-                                                       bottom=ws.cell(row=row, column=6).border.bottom,
-                                                       left=ws.cell(row=row, column=6).border.left, right=medium)
-
-        # S2
-        ws2 = wb.create_sheet("Ewidencja")
-        ws2.sheet_view.tabSelected = True
-
-        ws2.page_setup.paperSize = 9
-        ws2.page_setup.orientation = 'portrait'
-        ws2.page_setup.fitToPage = True
-        ws2.page_setup.fitToWidth = 1
-        ws2.page_setup.fitToHeight = 1
-        ws2.print_options.horizontalCentered = True
-
-        ws2.page_margins.left = 1.78 / 2.54
-        ws2.page_margins.right = 1.78 / 2.54
-        ws2.page_margins.top = 1.91 / 2.54
-        ws2.page_margins.bottom = 1.50 / 2.54
-
-        font_s2_group_header = Font(name=font_body_name, size=8, bold=False)
-        font_s2_vert_8 = Font(name=font_body_name, size=8, bold=False)
-        font_s2_vert_7 = Font(name=font_body_name, size=7, bold=False)
-        font_s2_day_lp = Font(name=font_body_name, size=10, bold=False)
-        font_s2_cell_data = Font(name=font_body_name, size=10, bold=False)
-        font_s2_razem = Font(name=font_body_name, size=7, bold=False)
-        font_s2_legend = Font(name=font_body_name, size=8, bold=False)
-        font_s2_sign = Font(name=font_body_name, size=10, bold=False)
-
-        ws2.column_dimensions['A'].width = 3.6
-        ws2.column_dimensions['B'].width = 6.0
-        for col_letter in ['C', 'D', 'E']: ws2.column_dimensions[col_letter].width = 4.2
-        for col_letter in ['F', 'G', 'H', 'I']: ws2.column_dimensions[col_letter].width = 4.2
-        for col_letter in ['J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q']: ws2.column_dimensions[col_letter].width = 3.3
-        ws2.column_dimensions['R'].width = 9.5
-
-        ws2.row_dimensions[1].height = 31
-        ws2.row_dimensions[2].height = 76
-
-        ws2.merge_cells('A1:A2')
-        ws2['A1'] = "Dzień\nmiesiąca"
-        ws2['A1'].font = font_s2_vert_8
-        ws2['A1'].alignment = align_vertical_90
-        ws2['A1'].border = border_thin
-
-        ws2['B1'] = "Czas\npracy"
-        ws2['B1'].font = font_s2_group_header
-        ws2['B1'].alignment = align_center
-        ws2['B1'].border = border_thin
-
-        ws2.merge_cells('C1:E1')
-        ws2['C1'] = "Czas przepracowany w\ngodzinach"
-        ws2['C1'].font = font_s2_group_header
-        ws2['C1'].alignment = align_center
-        ws2['C1'].border = border_thin
-
-        ws2.merge_cells('F1:Q1')
-        ws2['F1'] = "Czas nieobecności w pracy w godzinach"
-        ws2['F1'].font = font_s2_group_header
-        ws2['F1'].alignment = align_center
-        ws2['F1'].border = border_thin
-
-        ws2['R1'] = "Normatywny\nczas pracy z\nKP"
-        ws2['R1'].font = font_s2_group_header
-        ws2['R1'].alignment = align_center
-        ws2['R1'].border = border_thin
-        ws2['R2'].border = border_thin
-
-        headers_row2 = {
-            'B': "Liczba godzin\nprzepracowanych",
-            'C': "Niedziele i święta",
-            'D': "W porze nocnej",
-            'E': "W godzinach\nnadliczbowych",
-            'F': "Urlop wypoczynkowy",
-            'G': "Opieka KP 188 §1",
-            'H': "Opieka zasiłek",
-            'I': "L4 zwolnienie lekarskie",
-            'J': "Urlop okolicznościowy",
-            'K': "Urlop wypoczynkowy\n\"na żądanie\"",
-            'L': "Urlop bezpłatny",
-            'M': "Dni wolne za święto\nprzypadające w sobotę",
-            'N': "Urlop macierzyński",
-            'O': "Urlop rodzicielski",
-            'P': "Urlop dodatkowy",
-            'Q': ""
-        }
-
-        for col_idx, col_char in enumerate("ABCDEFGHIJKLMNOPQR", 1):
-            if col_idx == 1 or col_idx == 18: continue
-            cell = ws2.cell(row=2, column=col_idx)
-            cell.border = border_thin
-            if col_char in headers_row2:
-                cell.value = headers_row2[col_char]
-                cell.alignment = align_vertical_90
-                if col_idx <= 5:
-                    cell.font = font_s2_vert_8
-                else:
-                    cell.font = font_s2_vert_7
-            if col_idx >= 3 and col_idx <= 17:
-                ws2.cell(row=1, column=col_idx).border = border_thin
-
-        row_height_s2 = 17
-        for day in range(1, 32):
-            row = 2 + day
-            ws2.row_dimensions[row].height = row_height_s2
-            cell_day = ws2.cell(row=row, column=1)
-            cell_day.alignment = align_center
-            cell_day.border = border_thin
-            cell_day.font = font_s2_day_lp
-            for col in range(2, 19):
-                c = ws2.cell(row=row, column=col)
-                c.border = border_thin
-                c.font = font_s2_cell_data
-                c.alignment = align_center
-            if day <= days_in_month:
-                cell_day.value = day
-                if QDate(year, month, day) in holidays_map:
-                    for col in range(1, 19): ws2.cell(row=row, column=col).fill = grey_fill
-            else:
-                cell_day.value = "X"
-                for col in range(2, 19): ws2.cell(row=row, column=col).value = "X"
-
-        row_razem = 34
-        ws2.row_dimensions[row_razem].height = row_height_s2
-        cell_razem = ws2.cell(row=row_razem, column=1, value="razem")
-        cell_razem.font = font_s2_razem
-        cell_razem.alignment = align_center
-        cell_razem.border = border_thin
-        for col in range(2, 19):
-            c = ws2.cell(row=row_razem, column=col)
-            c.border = border_thin
-            c.font = font_s2_razem
-
-        footer_row = 35
-        ws2.row_dimensions[footer_row].height = 77.4
-        ws2.merge_cells(f'A{footer_row}:R{footer_row}')
-
-        # --- ZMIENNA PRZYWRÓCONA: Naprawa błędu NameError ---
-        legend_text = (
-            "Urlop wypoczynkowy, Opieka Art 188§1, Opieka zasiłek, L4, Urlop okolicznościowy, Urlop wypoczynkowy \"na żądanie\",  Urlop bezpłatny,  "
-            "Dn - Wypłata nadgodzin, Wś - Wolne za pracę w święto, Wn - Wolne za nadgodziny, W5 - Wolne z tytułu 5-dniowego tygodnia pracy, "
-            "W - Urlop wychowawczy, Um - Urlop macierzyński, ŚR - Świadczenia reabilitacyjne, Śs - Świadek w sądzie, Kr - Oddanie krwi., "
-            "S-szkolenie z udzielania dziecku pierwszej pomocy, D-delegacje/podróże służbowe, P-dni wolne na poszukiwanie pracy, "
-            "Urek-nieobecności za które zgodnie z par. 16 pkt 2 rozporządzenia w sprawie sposobu usprawiedliwienia nieobecności w pracy "
-            "oraz udzielania pracownikom zwolnień od pracy, pracownicy mają prawo do uzyskania rekompensaty pieniężnej od właściwego organu,"
-            "Sn - spóźnienie, N-nieusprawiedliwione nieobecności w pracy, Nun-nieobecność usprawiedliwiona niepłatna"
-        )
-        leg_cell = ws2[f'A{footer_row}']
-        leg_cell.value = legend_text
-        leg_cell.font = font_s2_legend
-        leg_cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
-        leg_cell.border = border_thin
-
-        sign_row = footer_row + 1
-        ws2.row_dimensions[sign_row].height = 13
-        ws2.merge_cells(f'A{sign_row}:E{sign_row}')
-        ws2[f'A{sign_row}'] = "PODPIS KADR"
-        ws2[f'A{sign_row}'].alignment = align_center
-        ws2[f'A{sign_row}'].font = font_s2_sign
-        ws2[f'A{sign_row}'].border = None
-
-        ws2.merge_cells(f'F{sign_row}:R{sign_row}')
-        ws2[f'F{sign_row}'] = "ODPIS DYREKTORA ŻŁOBKA"
-        ws2[f'F{sign_row}'].alignment = align_center
-        ws2[f'F{sign_row}'].font = font_s2_sign
-        ws2[f'F{sign_row}'].border = None
-
-        frame_last_row = 35
-        for col in range(1, 19):
-            ws2.cell(row=1, column=col).border = Border(top=medium, bottom=thin, left=thin, right=thin)
-        ws2['A35'].border = Border(top=thin, bottom=medium, left=medium, right=medium)
-        for row in range(1, frame_last_row + 1):
-            c = ws2.cell(row=row, column=1)
-            curr = c.border
-            c.border = Border(top=curr.top, bottom=curr.bottom, left=medium, right=curr.right)
-        for row in range(1, frame_last_row + 1):
-            c = ws2.cell(row=row, column=18)
-            curr = c.border
-            c.border = Border(top=curr.top, bottom=curr.bottom, left=curr.left, right=medium)
-
-        filename = f"{emp['name'].replace(' ', '_')}_{month_str}_{year}.xlsx"
-        path = os.path.join(folder, filename)
-        wb.save(path)
-        return path
-
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    ex = GeneratorListObecnosci()
-    ex.show()
-    sys.exit(app.exec_())
+    try:
+        app = QApplication(sys.argv)
+        ex = GeneratorListObecnosci()
+        ex.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        logging.critical(f"Krytyczny błąd aplikacji: {e}")
