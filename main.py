@@ -76,125 +76,6 @@ class RotatedHeaderDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class ExcelPreviewDialog(QDialog):
-    def __init__(self, filepath, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Podgląd: {os.path.basename(filepath)}")
-        self.resize(1100, 800)
-        self.filepath = filepath
-
-        layout = QVBoxLayout()
-        layout.addWidget(QLabel("Podgląd (Przełączaj zakładki poniżej):"))
-
-        # Zakładki dla arkuszy
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-        self.setLayout(layout)
-
-        self.rotated_delegate = RotatedHeaderDelegate(self)
-        self.load_excel_data()
-
-    def load_excel_data(self):
-        try:
-            # data_only=True -> pokazuje wyniki formuł/obliczeń
-            wb = load_workbook(self.filepath, data_only=True)
-
-            for sheet_name in wb.sheetnames:
-                ws = wb[sheet_name]
-                table = QTableWidget()
-                self.sheet_to_table(ws, table)
-                self.tabs.addTab(table, sheet_name)
-
-            wb.close()
-        except Exception as e:
-            QMessageBox.critical(self, "Błąd podglądu", f"Nie udało się wczytać pliku:\n{e}")
-
-    def sheet_to_table(self, ws, table):
-        max_r = ws.max_row
-        max_c = ws.max_column
-
-        # Wymuszenie 18 kolumn dla Ewidencji (żeby tło dochodziło do końca)
-        if "Ewidencja" in ws.title and max_c < 18:
-            max_c = 18
-
-        table.setRowCount(max_r)
-        table.setColumnCount(max_c)
-        table.horizontalHeader().setVisible(False)
-        table.verticalHeader().setVisible(False)
-        table.setStyleSheet("QTableWidget { background-color: white; gridline-color: #a0a0a0; }")
-
-        # 1. Wymiary
-        for col_idx in range(1, max_c + 1):
-            col_letter = get_column_letter(col_idx)
-            if col_letter in ws.column_dimensions:
-                width = ws.column_dimensions[col_letter].width
-                if width:
-                    table.setColumnWidth(col_idx - 1, int(width * 7.5))
-
-        for row_idx in range(1, max_r + 1):
-            if row_idx in ws.row_dimensions:
-                height = ws.row_dimensions[row_idx].height
-                if height:
-                    table.setRowHeight(row_idx - 1, int(height * 1.33))
-
-        # 2. Iteracja
-        for r in range(1, max_r + 1):
-            for c in range(1, max_c + 1):
-                cell = ws.cell(row=r, column=c)
-                val = cell.value
-                str_val = str(val) if val is not None else ""
-
-                item = QTableWidgetItem(str_val)
-                item.setFlags(Qt.ItemIsEnabled)
-
-                # Styl
-                font = QFont("Times New Roman", 9)
-                if cell.font:
-                    if cell.font.name: font.setFamily(cell.font.name)
-                    if cell.font.sz: font.setPointSize(int(cell.font.sz))
-                    if cell.font.b: font.setBold(True)
-                item.setFont(font)
-
-                align = Qt.AlignVCenter
-                if cell.alignment:
-                    if cell.alignment.horizontal == 'center':
-                        align |= Qt.AlignHCenter
-                    elif cell.alignment.horizontal == 'right':
-                        align |= Qt.AlignRight
-                    else:
-                        align |= Qt.AlignLeft
-                    if cell.alignment.vertical == 'top': align = (align & ~Qt.AlignVCenter) | Qt.AlignTop
-                item.setTextAlignment(align)
-
-                # Tło
-                if cell.fill and cell.fill.patternType == 'solid':
-                    fg = cell.fill.fgColor
-                    if hasattr(fg, 'rgb') and fg.rgb:
-                        if isinstance(fg.rgb, str):
-                            # AARRGGBB -> #RRGGBB
-                            hex_color = "#" + fg.rgb[2:] if len(fg.rgb) > 6 else "#" + fg.rgb
-                            item.setBackground(QColor(hex_color))
-
-                table.setItem(r - 1, c - 1, item)
-
-                # ROTACJA: Używamy setItemDelegateForColumn (bezpieczniejsze)
-                # Delegat sam sprawdzi wiersz, żeby nie obrócić stopki
-                if cell.alignment and cell.alignment.textRotation:
-                    if cell.alignment.textRotation in [90, 180]:
-                        table.setItemDelegateForColumn(c - 1, self.rotated_delegate)
-
-        # 3. Scalanie
-        for merge_range in ws.merged_cells.ranges:
-            min_col, min_row, max_col, max_row = merge_range.bounds
-            table.setSpan(min_row - 1, min_col - 1,
-                          max_row - min_row + 1, max_col - min_col + 1)
-
-
 class PrinterDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -244,6 +125,153 @@ class PrinterDialog(QDialog):
     def accept(self):
         self.selected_printer = self.printer_combo.currentText()
         super().accept()
+
+
+class ExcelPreviewDialog(QDialog):
+    def __init__(self, filepath, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Podgląd: {os.path.basename(filepath)}")
+        self.resize(1100, 800)
+        self.filepath = filepath
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Podgląd (Przełączaj zakładki poniżej):"))
+
+        # Zakładki dla arkuszy
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # --- ZMIANA: Dodano przycisk drukowania w oknie podglądu ---
+        btn_layout = QHBoxLayout()
+
+        self.print_btn = QPushButton("🖨️ Drukuj ten dokument")
+        self.print_btn.setMinimumHeight(40)
+        self.print_btn.setStyleSheet("font-weight: bold; background-color: #2196F3; color: white;")
+        self.print_btn.clicked.connect(self.print_current_file)
+
+        close_btn = QPushButton("Zamknij")
+        close_btn.setMinimumHeight(40)
+        close_btn.clicked.connect(self.reject)
+
+        btn_layout.addWidget(self.print_btn)
+        btn_layout.addStretch()  # Odstęp
+        btn_layout.addWidget(close_btn)
+
+        layout.addLayout(btn_layout)
+
+        self.setLayout(layout)
+
+        self.rotated_delegate = RotatedHeaderDelegate(self)
+        self.load_excel_data()
+
+    def load_excel_data(self):
+        try:
+            wb = load_workbook(self.filepath, data_only=True)
+
+            for sheet_name in wb.sheetnames:
+                ws = wb[sheet_name]
+                table = QTableWidget()
+                self.sheet_to_table(ws, table)
+                self.tabs.addTab(table, sheet_name)
+
+            wb.close()
+        except Exception as e:
+            QMessageBox.critical(self, "Błąd podglądu", f"Nie udało się wczytać pliku:\n{e}")
+
+    def sheet_to_table(self, ws, table):
+        max_r = ws.max_row
+        max_c = ws.max_column
+
+        # Wymuszenie 18 kolumn dla Ewidencji
+        if "Ewidencja" in ws.title and max_c < 18:
+            max_c = 18
+
+        table.setRowCount(max_r)
+        table.setColumnCount(max_c)
+        table.horizontalHeader().setVisible(False)
+        table.verticalHeader().setVisible(False)
+        table.setStyleSheet("QTableWidget { background-color: white; gridline-color: #a0a0a0; }")
+
+        # Wymiary
+        for col_idx in range(1, max_c + 1):
+            col_letter = get_column_letter(col_idx)
+            if col_letter in ws.column_dimensions:
+                width = ws.column_dimensions[col_letter].width
+                if width:
+                    table.setColumnWidth(col_idx - 1, int(width * 7.5))
+
+        for row_idx in range(1, max_r + 1):
+            if row_idx in ws.row_dimensions:
+                height = ws.row_dimensions[row_idx].height
+                if height:
+                    table.setRowHeight(row_idx - 1, int(height * 1.33))
+
+        # Iteracja
+        for r in range(1, max_r + 1):
+            for c in range(1, max_c + 1):
+                cell = ws.cell(row=r, column=c)
+                val = cell.value
+                str_val = str(val) if val is not None else ""
+
+                item = QTableWidgetItem(str_val)
+                item.setFlags(Qt.ItemIsEnabled)
+
+                # Styl
+                font = QFont("Times New Roman", 9)
+                if cell.font:
+                    if cell.font.name: font.setFamily(cell.font.name)
+                    if cell.font.sz: font.setPointSize(int(cell.font.sz))
+                    if cell.font.b: font.setBold(True)
+                item.setFont(font)
+
+                align = Qt.AlignVCenter
+                if cell.alignment:
+                    if cell.alignment.horizontal == 'center':
+                        align |= Qt.AlignHCenter
+                    elif cell.alignment.horizontal == 'right':
+                        align |= Qt.AlignRight
+                    else:
+                        align |= Qt.AlignLeft
+                    if cell.alignment.vertical == 'top': align = (align & ~Qt.AlignVCenter) | Qt.AlignTop
+                item.setTextAlignment(align)
+
+                # Tło
+                if cell.fill and cell.fill.patternType == 'solid':
+                    fg = cell.fill.fgColor
+                    if hasattr(fg, 'rgb') and fg.rgb:
+                        if isinstance(fg.rgb, str):
+                            hex_color = "#" + fg.rgb[2:] if len(fg.rgb) > 6 else "#" + fg.rgb
+                            item.setBackground(QColor(hex_color))
+
+                table.setItem(r - 1, c - 1, item)
+
+                # ROTACJA
+                if cell.alignment and cell.alignment.textRotation:
+                    if cell.alignment.textRotation in [90, 180]:
+                        table.setItemDelegateForColumn(c - 1, self.rotated_delegate)
+
+        # Scalanie
+        for merge_range in ws.merged_cells.ranges:
+            min_col, min_row, max_col, max_row = merge_range.bounds
+            table.setSpan(min_row - 1, min_col - 1,
+                          max_row - min_row + 1, max_col - min_col + 1)
+
+    # --- NOWA METODA DRUKOWANIA Z PODGLĄDU ---
+    def print_current_file(self):
+        printer_dialog = PrinterDialog(self)
+        if printer_dialog.exec_() == QDialog.Accepted:
+            selected_printer = printer_dialog.selected_printer
+            original_printer = win32print.GetDefaultPrinter()
+            try:
+                win32print.SetDefaultPrinter(selected_printer)
+                # Drukujemy aktualnie podglądany plik
+                win32api.ShellExecute(0, "print", self.filepath, None, ".", 0)
+                QMessageBox.information(self, "Sukces", f"Wysłano do druku:\n{selected_printer}")
+            except Exception as e:
+                logging.error(f"Błąd druku z podglądu: {e}")
+                QMessageBox.critical(self, "Błąd druku", f"Wystąpił błąd: {e}")
+            finally:
+                win32print.SetDefaultPrinter(original_printer)
 
 
 class EdytorPracownikow(QDialog):
@@ -645,6 +673,10 @@ class WorkerThread(QThread):
         total = len(self.employees)
         try:
             for i, emp in enumerate(self.employees):
+                # Jeśli folder nie jest zdefiniowany (np. użytkownik anulował), wątek się nie uda
+                if not self.folder:
+                    raise Exception("Nie wybrano folderu zapisu.")
+
                 filepath = self.generator.create_file(emp, self.folder, self.month, self.year, self.month_str,
                                                       self.holidays_map)
                 generated_map[emp['key']] = filepath
@@ -667,13 +699,13 @@ class WorkerThread(QThread):
 
 
 # ==========================================
-# 3. GŁÓWNA APLIKACJA
+# 4. GŁÓWNA APLIKACJA
 # ==========================================
 
 class GeneratorListObecnosci(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Generator List Obecności v18.0 (Final Repair)")
+        self.setWindowTitle("Generator List Obecności v20.0 (Final Complete)")
         self.setGeometry(100, 100, 1100, 800)
         self.generated_files_map = {}
 
@@ -693,7 +725,9 @@ class GeneratorListObecnosci(QMainWindow):
                 pass
 
     def save_config(self):
-        self.config['SETTINGS'] = {'LastFolder': self.last_save_folder}
+        if 'SETTINGS' not in self.config:
+            self.config['SETTINGS'] = {}
+        self.config['SETTINGS']['LastFolder'] = self.last_save_folder
         with open('config.ini', 'w') as configfile:
             self.config.write(configfile)
 
@@ -763,13 +797,23 @@ class GeneratorListObecnosci(QMainWindow):
         self.print_btn.setEnabled(False)
         action_layout.addWidget(self.print_btn)
 
+        # PRZYCISKI FOLDERU
+        folder_btns_layout = QHBoxLayout()
+
         self.open_folder_btn = QPushButton("Otwórz folder")
         self.open_folder_btn.clicked.connect(self.open_last_folder)
+        self.open_folder_btn.setEnabled(False)
+
+        self.change_folder_btn = QPushButton("Zmień folder zapisu")
+        self.change_folder_btn.clicked.connect(self.change_save_folder)
+
+        folder_btns_layout.addWidget(self.open_folder_btn)
+        folder_btns_layout.addWidget(self.change_folder_btn)
+        action_layout.addLayout(folder_btns_layout)
+
+        # Jeśli folder jest w configu, aktywujemy przycisk
         if self.last_save_folder and os.path.exists(self.last_save_folder):
             self.open_folder_btn.setEnabled(True)
-        else:
-            self.open_folder_btn.setEnabled(False)
-        action_layout.addWidget(self.open_folder_btn)
 
         action_group.setLayout(action_layout)
         left_panel.addWidget(action_group)
@@ -912,6 +956,15 @@ class GeneratorListObecnosci(QMainWindow):
                 self.print_btn.setEnabled(False)
                 self.print_btn.setText("Zaznacz pracowników do druku")
 
+    # --- ZMIANA: ZMIANA FOLDERU ZAPISU ---
+    def change_save_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Wybierz nowy folder domyślny")
+        if folder:
+            self.last_save_folder = folder
+            self.save_config()
+            self.open_folder_btn.setEnabled(True)
+            QMessageBox.information(self, "Sukces", f"Domyślny folder zmieniony na:\n{folder}")
+
     def start_generation_thread(self):
         employees_to_generate = []
         for i in range(self.emp_list_widget.count()):
@@ -927,14 +980,26 @@ class GeneratorListObecnosci(QMainWindow):
             QMessageBox.warning(self, "Błąd", "Nie zaznaczono żadnego pracownika!")
             return
 
-        folder = QFileDialog.getExistingDirectory(self, "Wybierz folder zapisu", self.last_save_folder)
-        if not folder:
-            return
+        # Ustalanie folderu docelowego
+        target_folder = ""
 
-        self.last_save_folder = folder
-        self.save_config()
+        # 1. Sprawdzamy, czy jest zapisany w configu
+        if self.last_save_folder and os.path.exists(self.last_save_folder):
+            target_folder = self.last_save_folder
+        else:
+            # 2. Jeśli nie ma, tworzymy folder domyślny obok programu
+            default_path = os.path.join(os.getcwd(), "Wygenerowane Karty")
+            if not os.path.exists(default_path):
+                try:
+                    os.makedirs(default_path)
+                except Exception:
+                    pass
+            target_folder = default_path
 
-        self.open_folder_btn.setEnabled(True)
+            # Zapisujemy ten domyślny folder jako ostatni używany
+            self.last_save_folder = target_folder
+            self.save_config()
+            self.open_folder_btn.setEnabled(True)
 
         month_idx = self.month_cb.currentIndex() + 1
         year = int(self.year_cb.currentText())
@@ -946,7 +1011,7 @@ class GeneratorListObecnosci(QMainWindow):
         self.generate_btn.setEnabled(False)
         self.print_btn.setEnabled(False)
 
-        self.thread = WorkerThread(employees_to_generate, folder, month_idx, year, month_name, holidays_map)
+        self.thread = WorkerThread(employees_to_generate, target_folder, month_idx, year, month_name, holidays_map)
         self.thread.progress_updated.connect(self.progress_bar.setValue)
         self.thread.finished.connect(self.on_generation_finished)
         self.thread.error_occurred.connect(self.on_generation_error)
@@ -957,7 +1022,7 @@ class GeneratorListObecnosci(QMainWindow):
         self.progress_bar.setVisible(False)
         self.generate_btn.setEnabled(True)
         self.update_print_button_state()
-        QMessageBox.information(self, "Sukces", f"Wygenerowano plików: {len(generated_map)}")
+        QMessageBox.information(self, "Sukces", f"Wygenerowano plików: {len(generated_map)}\nLokalizacja: {folder}")
 
     def on_generation_error(self, error_msg):
         self.progress_bar.setVisible(False)
@@ -975,7 +1040,7 @@ class GeneratorListObecnosci(QMainWindow):
         if employee_key in self.generated_files_map:
             filepath = self.generated_files_map[employee_key]
             if os.path.exists(filepath):
-                # TO OTWIERA WBUDOWANY PODGLĄD (NOWY DLA WERSJI 18.0)
+                # TO OTWIERA WBUDOWANY PODGLĄD (NOWY DLA WERSJI 20.0)
                 preview = ExcelPreviewDialog(filepath, self)
                 preview.exec_()
             else:
